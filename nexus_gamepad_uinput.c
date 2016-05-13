@@ -4,6 +4,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <dirent.h> 
 #include <errno.h>
 #include <linux/input.h>
 #include <linux/uinput.h>
@@ -20,7 +21,7 @@
 #define BITS_PER_LONG (sizeof(long) * 8)
 #define LONGS_TO_FIT_BITS(x) ((((x)-1)/BITS_PER_LONG)+1)
 #define testbit(in, b)	((in[(b)/BITS_PER_LONG] & (((unsigned long)1) << ((b)%BITS_PER_LONG))))
-
+#define DEV_INPUT "/dev/input/"
 
 /*
  * Print exit message, append error (if there is one)
@@ -143,36 +144,45 @@ void set_dev_info(int fd_uinput, struct user_dev_events *dev, struct uinput_user
     //Create device
     if(ioctl(fd_uinput, UI_DEV_CREATE) < 0) die("Line %d, ioctl",__LINE__);
 }
+void help(char *progname) {
+    printf("USAGE: ./%s [<device>|-n <device name>]\n",progname);
+    printf("\t<device>\tTranslate input from device and exit when device is disconnected\n");
+    printf("\t-n <device name>\tHook device with matching name, search for new device on disconnect \n\t\t- keeping the same translated uinput device. This may help with controls stopping working in some emulators\n");
+    exit(0);
+}
 
-
-int main (int argc, char *argv[])
-{
-    int fd_in,fd_out,i,size = sizeof (struct input_event);
-    struct input_event ev;
-    char in_name[256] = "NULL";
-    char new_name[UINPUT_MAX_NAME_SIZE];
-    char *device = NULL;
+int open_and_lock_evdev(char * evdev_device) {
+    int fd_in;
     
+    if ((fd_in = open (evdev_device, O_RDONLY)) == -1)
+       return -1;
+    
+    //Get exclusive access so nobody uses the original device...
+    //Maybe should check for -EBUSY specifically?
+    if (ioctl(fd_in, EVIOCGRAB, 1) < 0)
+        return -2;
+        
+    
+    return fd_in;
+}
+int close_and_unlock_evdev(int fd) {
+    //TODO: Should we handle if we fail to ungrab the device?
+    ioctl(fd, EVIOCGRAB, 0);
+    close(fd);
+}
+int create_uinput_device(int fd_in) {
     struct user_dev_events de;
     struct uinput_user_dev uinput;
-    
-    if (argc == 2) {
-        device = argv[1];
-    } else {
-        die("USAGE: ./%s <event device>",argv[0]);
-    }
+    char in_name[256] = "NULL";
+    char new_name[UINPUT_MAX_NAME_SIZE];
+    int fd_out;
     
     fd_out = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
     if(fd_out < 0) die("Line %d, open",__LINE__);
 
 
     //Open Device
-    if ((fd_in = open (device, O_RDONLY)) == -1)
-        die ("Failed to open device %s", device); 
-
-    //Get exclusive access so nobody uses the original device...
-    ioctl(fd_in, EVIOCGRAB, 1);
-
+    
     
     //Read device info into de and uinput
     read_dev_info(fd_in,&de,&uinput);
@@ -194,11 +204,78 @@ int main (int argc, char *argv[])
     strcpy(uinput.name,new_name);
     
     set_dev_info(fd_out,&de,&uinput);
- 
-  while (1){
+    return fd_out;
+    
+}
+int kill_uinput_device(int fd_out) {
+    //TODO: Do something useful if we fail...
+    ioctl(fd_out, UI_DEV_DESTROY); 
+    close(fd_out);
+}
+int open_matching_device(char * device_name) {
+    DIR           *dir;
+    struct dirent *dir_entry;
+    char read_name[UINPUT_MAX_NAME_SIZE]; //Wonder what the const for the real max name is
+    char device_file[PATH_MAX];
+    int fd_in;
+    
+    strcpy(device_file,DEV_INPUT);
+    
+    //TODO: This could probably be made more advanced, 
+    //    ie first look at existing and then simply monitor for changes...
+    while (1) {
+        dir = opendir(DEV_INPUT);
+        if (!dir)
+            return -1;
+            
+        while ((dir_entry = readdir(dir)) != NULL)
+        {
+          //Do not hog the computer!
+          usleep(20*1000);
+          
+          if (dir_entry->d_type != DT_CHR)
+             continue;
+             
+          if(strncmp("event",dir_entry->d_name, strlen("event")))
+            continue;
+          
+          strcpy(device_file+strlen(DEV_INPUT),dir_entry->d_name);
+          //printf("Is event device: %s!\n",device_file);   
+          
+          fd_in = open_and_lock_evdev(device_file);
+          if (fd_in < 0) {
+              //printf("Fail to lock device!\n");
+              continue;
+          }
+          if (ioctl (fd_in, EVIOCGNAME (UINPUT_MAX_NAME_SIZE), read_name) == -1) {
+              //printf("Fail to get name!\n");
+              close_and_unlock_evdev(fd_in);
+              continue;
+          }
+          
+          if (strcmp(read_name,device_name)) {
+              close_and_unlock_evdev(fd_in);
+              continue;
+          }
+          
+          printf("Device: %s name: %s!\n",device_file,read_name);
+          
+          closedir(dir);
+          return fd_in;
+        }
+
+        closedir(dir);
+    }
+    
+}
+
+int wrap_device(int fd_out, int fd_in) {    
+      struct input_event ev;
+      int size = sizeof (struct input_event);
+      while (1){
       //Read original device event
       if (read (fd_in, &ev, size) < size)
-          die ("Line %d, read",__LINE__);
+          return -2;
           
         //Translate KEY_ events. ( KEY_BACK -> BTN_START, KEY_HOMEPAGE -> BTN_SELECT )
         if (ev.type == EV_KEY && ev.code == KEY_BACK)
@@ -209,14 +286,53 @@ int main (int argc, char *argv[])
             
         //Write device event
       if(write(fd_out, &ev, sizeof(struct input_event)) < 0)
-        die("Line %d, write",__LINE__);
+        return -1;
     }
-
-    if(ioctl(fd_out, UI_DEV_DESTROY) < 0)
-        die("Line %d, ioctl",__LINE__);
-        
     close(fd_in);
-    close(fd_out);
-
+    return 0;
+}
+int main (int argc, char *argv[])
+{
+    int fd_in,fd_out,i;
+    
+    
+    char *device = NULL;
+    
+    if (argc == 2) {
+        device = argv[1];
+        fd_in = open_and_lock_evdev(device);
+        if (fd_in < 0)
+            die("Line %d, open_and_lock_evdev(%s)",__LINE__,device);
+            
+        fd_out = create_uinput_device(fd_in);
+        if (wrap_device(fd_out,fd_in))
+            die("Line %d, wrap_device",__LINE__);
+        
+        kill_uinput_device(fd_out);
+        close_and_unlock_evdev(fd_in);
+            
+    } else if (argc == 3 && !strcmp("-n",argv[1])) {
+        do {
+            fd_in = open_matching_device(argv[2]);
+        } while (fd_in < 0);
+        
+        fd_out = create_uinput_device(fd_in);
+        
+        while(1) {
+            wrap_device(fd_out,fd_in);
+            close_and_unlock_evdev(fd_in);
+            
+            do {
+                fd_in = open_matching_device(argv[2]);
+            } while (fd_in < 0);
+            
+        }
+        kill_uinput_device(fd_out);
+        
+    } else {
+        help(argv[0]);
+        
+    }
+    
     return 0;
 }
