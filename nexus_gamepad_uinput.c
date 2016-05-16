@@ -22,7 +22,9 @@
 #define LONGS_TO_FIT_BITS(x) ((((x)-1)/BITS_PER_LONG)+1)
 #define testbit(in, b)	((in[(b)/BITS_PER_LONG] & (((unsigned long)1) << ((b)%BITS_PER_LONG))))
 #define DEV_INPUT "/dev/input/"
+#define DEV_PREFIX "nexus"
 
+int sleeptime = 20*1000;
 /*
  * Print exit message, append error (if there is one)
  * and exit with code 1
@@ -145,9 +147,10 @@ void set_dev_info(int fd_uinput, struct user_dev_events *dev, struct uinput_user
     if(ioctl(fd_uinput, UI_DEV_CREATE) < 0) die("Line %d, ioctl",__LINE__);
 }
 void help(char *progname) {
-    printf("USAGE: ./%s [<device>|-n <device name>]\n",progname);
-    printf("\t<device>\tTranslate input from device and exit when device is disconnected\n");
-    printf("\t-n <device name>\tHook device with matching name, search for new device on disconnect \n\t\t- keeping the same translated uinput device. This may help with controls stopping working in some emulators\n");
+    printf("USAGE: ./%s [-s <sleep ms>] [-d <device>|-n <device name>]\n",progname);
+    printf("\t-d <device>\tTranslate input from device and exit when device is disconnected\n");
+    printf("\t-n <device name>\tHook device with matching name, search for new device on disconnect \n\t\t\tkeeping the same translated uinput device. This may help with controls stopping working in some emulators\n");
+    printf("\t-s <sleep ms>\tDefine time to sleep between checking each device in /dev/input\n");
     exit(0);
 }
 
@@ -192,6 +195,8 @@ int create_uinput_device(int fd_in) {
         die("Cannot translate to BTN_START and BTN_SELECT as it seems at least one of these keys are already used by the device\n");
     }
     
+    //First location to modify if you want to adapt to another controller
+    
     //Unset keys to be replaced
     de.bits[EV_KEY][KEY_BACK] = 0;
     de.bits[EV_KEY][KEY_HOMEPAGE] = 0;
@@ -207,11 +212,24 @@ int create_uinput_device(int fd_in) {
     return fd_out;
     
 }
+
 int kill_uinput_device(int fd_out) {
     //TODO: Do something useful if we fail...
     ioctl(fd_out, UI_DEV_DESTROY); 
     close(fd_out);
 }
+
+/*
+ * Loop through files in DEV_INPUT that have prefix DEV_PREFIX
+ * (currently nexus as a udev-rule should rename devices matching our
+ * device to nexusNN to avoid other programs reading from it)
+ * 
+ * device_name should be the name reported by the device when EVIOCGNAME
+ * 
+ * returns file descriptor or a negative number on error.
+ * 
+ * note: May loop forever
+ */
 int open_matching_device(char * device_name) {
     DIR           *dir;
     struct dirent *dir_entry;
@@ -227,16 +245,17 @@ int open_matching_device(char * device_name) {
         dir = opendir(DEV_INPUT);
         if (!dir)
             return -1;
-            
+        
+        
         while ((dir_entry = readdir(dir)) != NULL)
         {
           //Do not hog the computer!
-          usleep(20*1000);
+          usleep(sleeptime);
           
           if (dir_entry->d_type != DT_CHR)
              continue;
              
-          if(strncmp("event",dir_entry->d_name, strlen("event")))
+          if(strncmp(DEV_PREFIX,dir_entry->d_name, strlen(DEV_PREFIX)))
             continue;
           
           strcpy(device_file+strlen(DEV_INPUT),dir_entry->d_name);
@@ -269,6 +288,14 @@ int open_matching_device(char * device_name) {
     
 }
 
+
+
+/*
+ * Second location to modify if adapting for other controller
+ * 
+ * Loop that reads events and outputs uinput events - Translating events
+ * if nessecary
+ */
 int wrap_device(int fd_out, int fd_in) {    
       struct input_event ev;
       int size = sizeof (struct input_event);
@@ -291,15 +318,36 @@ int wrap_device(int fd_out, int fd_in) {
     close(fd_in);
     return 0;
 }
+
 int main (int argc, char *argv[])
 {
-    int fd_in,fd_out,i;
-    
-    
+    int fd_in,fd_out,i,c;
     char *device = NULL;
+    char *device_name = NULL;
+    while ((c = getopt (argc, argv, "s:n:d:")) != -1)
+    {
+        switch(c) {
+            case 's':
+                sleeptime = atoi(optarg)*1000;
+                break;
+            case 'n':
+                device_name = optarg;
+                break;
+            case 'd':
+                device = optarg;
+                break;
+            default:
+                help(argv[0]);
+                exit(0);
+        }
+    }
+    //TODO: Should check that no overflow arguments exist
     
-    if (argc == 2) {
-        device = argv[1];
+    if (device != NULL && device_name != NULL) {
+        help(argv[0]);
+        exit(0);
+    }
+    if (device != NULL) {
         fd_in = open_and_lock_evdev(device);
         if (fd_in < 0)
             die("Line %d, open_and_lock_evdev(%s)",__LINE__,device);
@@ -311,9 +359,9 @@ int main (int argc, char *argv[])
         kill_uinput_device(fd_out);
         close_and_unlock_evdev(fd_in);
             
-    } else if (argc == 3 && !strcmp("-n",argv[1])) {
+    } else if (device_name != NULL) {
         do {
-            fd_in = open_matching_device(argv[2]);
+            fd_in = open_matching_device(device_name);
         } while (fd_in < 0);
         
         fd_out = create_uinput_device(fd_in);
@@ -323,7 +371,7 @@ int main (int argc, char *argv[])
             close_and_unlock_evdev(fd_in);
             
             do {
-                fd_in = open_matching_device(argv[2]);
+                fd_in = open_matching_device(device_name);
             } while (fd_in < 0);
             
         }
